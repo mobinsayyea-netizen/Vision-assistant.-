@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vision Assistant</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font:20px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh;padding:12px;gap:12px}
+button{font:bold 24px system-ui;padding:20px;border:0;border-radius:16px;background:#ffd400;color:#000;width:100%}
+#go{min-height:120px;background:#2ecc71}
+#go.on{background:#e74c3c;color:#fff}
+.row{display:flex;gap:12px}.row button{flex:1}
+#out{flex:1;overflow:auto;font-size:28px;line-height:1.4;padding:8px;border:2px solid #444;border-radius:12px;min-height:100px}
+#cam{position:fixed;width:2px;height:2px;opacity:.01;pointer-events:none}
+dialog{background:#111;color:#fff;border:2px solid #ffd400;border-radius:16px;width:92%}
+input,select{width:100%;font-size:20px;padding:12px;margin:6px 0 14px}
+</style></head><body>
+<div id="out">Press Start.</div>
+<button id="go">Start</button>
+<div class="row"><button id="stopspeak">Stop Speaking</button><button id="rep">Repeat</button></div>
+<button id="set">Settings</button>
+<video id="cam" playsinline muted></video>
+<dialog id="dlg"><h2>Settings</h2>
+<label>API key<input id="k" type="password" autocomplete="off"></label>
+<label>Speech speed<input id="r" type="range" min="0.6" max="2" step="0.1"></label>
+<label>Camera<select id="f"><option value="environment">Back</option><option value="user">Front</option></select></label>
+<button id="sv">Save</button></dialog>
+<script>
+// ---- Change these if Google/DeepSeek rename models ----
+const GEMINI_MODEL="gemini-3.1-flash-live-preview";
+const OAI={deepseek:{url:"https://api.deepseek.com/chat/completions",model:"deepseek-v4-flash-vision-exp"},
+ openai:{url:"https://api.openai.com/v1/chat/completions",model:"gpt-4o-mini"}};
+const SYS="You are live eyes for a blind person who is moving around. Describe what is in front of the camera in short, clear sentences. Mention obstacles, people, doors, stairs, vehicles and text first, with direction (left, right, ahead) and rough distance. Never say it is safe to cross a road. Reply in Hindi (Devanagari) unless the user speaks English. Keep answers under 25 words unless asked for more.";
+const $=id=>document.getElementById(id);
+const ls=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch{}};
+let key=ls("k")||"",rate=parseFloat(ls("r"))||1,facing=ls("f")||"environment";
+let running=false,stream,ws,ready=false,tries=0,timer,ctx,proc,rec,ctl,hist=[],last="",buf="",full="";
+const vid=$("cam"),go=$("go");
+
+function detect(k){k=k.trim();if(/^AIza/.test(k))return"gemini";if(/^sk-ant-/.test(k))return"";
+ if(/^sk-[a-f0-9]{32}$/i.test(k))return"deepseek";if(/^sk-/.test(k))return"openai";return""}
+
+// ---- Speech out (phone's own TTS) ----
+function speak(t){if(!t.trim())return;const u=new SpeechSynthesisUtterance(t);u.rate=rate;
+ u.lang=/[\u0900-\u097F]/.test(t)?"hi-IN":"en-IN";speechSynthesis.speak(u)}
+function hush(){speechSynthesis.cancel()}
+function say(t){$("out").textContent=t;hush();speak(t)}
+function feed(t){buf+=t;full+=t;$("out").textContent=full;let m;
+ while((m=buf.match(/^[\s\S]*?[.!?\u0964\n]/))){speak(m[0]);buf=buf.slice(m[0].length)}}
+function endTurn(){if(buf.trim())speak(buf);buf="";if(full)last=full;full=""}
+function reset(){hush();buf="";full=""}
+
+// ---- Camera ----
+async function openCam(mic){
+ stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:640}},
+  audio:mic?{echoCancellation:true,noiseSuppression:true}:false});
+ vid.srcObject=stream;await vid.play()}
+function frame(){const w=512,h=Math.round(w*(vid.videoHeight||3)/(vid.videoWidth||4)),c=document.createElement("canvas");
+ c.width=w;c.height=h;c.getContext("2d").drawImage(vid,0,0,w,h);return c.toDataURL("image/jpeg",.6)}
+
+// ---- Gemini Live (tries TEXT replies first, falls back to AUDIO + transcript) ----
+function gem(mi){
+ const mode=["TEXT","AUDIO"][mi];ready=false;
+ ws=new WebSocket("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+encodeURIComponent(key));
+ ws.onopen=()=>{const s={model:"models/"+GEMINI_MODEL,responseModalities:[mode],systemInstruction:{parts:[{text:SYS}]}};
+  if(mode=="AUDIO")s.outputAudioTranscription={};ws.send(JSON.stringify({setup:s}))};
+ ws.onmessage=async e=>{let d=e.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
+  if(m.setupComplete){ready=true;tries=0;gemOut();
+   ws.send(JSON.stringify({realtimeInput:{text:"Briefly describe what is in front of me."}}));return}
+  const c=m.serverContent;if(!c)return;
+  if(c.interrupted)reset();
+  if(mode=="TEXT"&&c.modelTurn)c.modelTurn.parts.forEach(p=>p.text&&feed(p.text));
+  if(c.outputTranscription&&c.outputTranscription.text)feed(c.outputTranscription.text);
+  if(c.turnComplete)endTurn()};
+ ws.onclose=ev=>{clearInterval(timer);if(!running)return;
+  if(!ready&&mi<1)return gem(mi+1);
+  if(++tries>4){say("Connection failed. "+(ev.reason||"Check your key, model name and internet."));stop(1);return}
+  say("Reconnecting");setTimeout(()=>running&&gem(mi),1000)}}
+function gemOut(){
+ try{proc&&proc.disconnect();ctx&&ctx.close()}catch{}
+ ctx=new AudioContext({sampleRate:16000});const src=ctx.createMediaStreamSource(stream);
+ proc=ctx.createScriptProcessor(4096,1,1);
+ proc.onaudioprocess=e=>{if(!ws||ws.readyState!=1||!ready)return;
+  const f=e.inputBuffer.getChannelData(0),p=new Int16Array(f.length);
+  for(let i=0;i<f.length;i++)p[i]=Math.max(-1,Math.min(1,f[i]))*32767;
+  const b=new Uint8Array(p.buffer);let s="";for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);
+  ws.send(JSON.stringify({realtimeInput:{audio:{data:btoa(s),mimeType:"audio/pcm;rate=16000"}}}))};
+ src.connect(proc);proc.connect(ctx.destination);
+ timer=setInterval(()=>{if(ws.readyState==1)ws.send(JSON.stringify({realtimeInput:{video:{data:frame().split(",")[1],mimeType:"image/jpeg"}}}))},1000)}
+
+// ---- DeepSeek / OpenAI (voice recognition + one frame per question, streamed reply) ----
+function oai(){
+ const P=OAI[detect(key)],R=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(!R){say("Speech recognition is not supported here. Please use Chrome.");stop(1);return}
+ rec=new R();rec.lang="hi-IN";rec.continuous=true;rec.interimResults=false;
+ rec.onspeechstart=()=>{reset();ctl&&ctl.abort()};
+ rec.onresult=e=>ask(e.results[e.results.length-1][0].transcript,P);
+ rec.onend=()=>{if(running)try{rec.start()}catch{}};
+ rec.onerror=e=>{if(e.error=="not-allowed"||e.error=="service-not-allowed"){say("Microphone permission denied.");stop(1)}};
+ rec.start()}
+async function ask(t,P){
+ ctl=new AbortController();
+ const msgs=[{role:"system",content:SYS},...hist.slice(-6),
+  {role:"user",content:[{type:"text",text:t},{type:"image_url",image_url:{url:frame()}}]}];
+ try{
+  const r=await fetch(P.url,{method:"POST",signal:ctl.signal,headers:{"Content-Type":"application/json",Authorization:"Bearer "+key},
+   body:JSON.stringify({model:P.model,messages:msgs,stream:true,max_tokens:150})});
+  if(!r.ok){say("Error "+r.status+". Check your key, balance and model name.");return}
+  const rd=r.body.getReader(),dec=new TextDecoder();let line="",txt="";
+  for(;;){const{done,value}=await rd.read();if(done)break;
+   line+=dec.decode(value,{stream:true});const ls2=line.split("\n");line=ls2.pop();
+   for(const l of ls2){if(!l.startsWith("data: ")||l.includes("[DONE]"))continue;
+    try{const j=JSON.parse(l.slice(6)).choices[0].delta.content;if(j){txt+=j;feed(j)}}catch{}}}
+  endTurn();hist.push({role:"user",content:t},{role:"assistant",content:txt})
+ }catch(e){if(e.name!="AbortError")say("Network error.")}}
+
+// ---- Start / Stop ----
+async function start(){
+ const p=detect(key);
+ if(!p){say("Please open Settings and enter a valid API key.");return}
+ running=true;go.classList.add("on");go.textContent="Stop";hist=[];tries=0;
+ hush();speak("Starting");
+ try{await openCam(p=="gemini")}catch{say("Camera or microphone permission denied.");stop(1);return}
+ p=="gemini"?gem(0):oai()}
+function stop(keep){
+ running=false;go.classList.remove("on");go.textContent="Start";clearInterval(timer);
+ try{ws&&ws.close()}catch{}try{rec&&rec.stop()}catch{}
+ try{proc&&proc.disconnect();ctx&&ctx.close()}catch{}
+ ctl&&ctl.abort();stream&&stream.getTracks().forEach(t=>t.stop());
+ if(!keep)hush()}
+go.onclick=()=>{if(running){stop();say("Stopped")}else start()};
+$("stopspeak").onclick=reset;
+$("rep").onclick=()=>{hush();if(last){$("out").textContent=last;speak(last)}else speak("Nothing to repeat")};
+$("set").onclick=()=>{$("k").value=key;$("r").value=rate;$("f").value=facing;$("dlg").showModal()};
+$("sv").onclick=()=>{key=$("k").value.trim();rate=parseFloat($("r").value)||1;facing=$("f").value;
+ ls("k",key);ls("r",rate);ls("f",facing);$("dlg").close();
+ const p=detect(key);
+ say(p?({gemini:"Gemini",deepseek:"DeepSeek",openai:"OpenAI"})[p]+" key saved":"Key not recognised")};
+</script></body></html>
