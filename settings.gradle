@@ -1,0 +1,2 @@
+rootProject.name = "vision-assistant"
+include ':app'
