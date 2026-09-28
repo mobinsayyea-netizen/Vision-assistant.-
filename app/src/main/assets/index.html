@@ -40,9 +40,15 @@ function detect(k){k=k.trim();if(/^AIza/.test(k))return"gemini";if(/^sk-ant-/.te
  if(/^sk-[a-f0-9]{32}$/i.test(k))return"deepseek";if(/^sk-/.test(k))return"openai";return""}
 
 // ---- Speech out (phone's own TTS) ----
-function speak(t){if(!t.trim())return;const u=new SpeechSynthesisUtterance(t);u.rate=rate;
+// Android's WebView does not support window.speechSynthesis (it silently does nothing there,
+// unlike in Chrome) — window.AndroidTTS is a native bridge the Android app injects instead.
+// The web-only fallback below keeps this file working if opened directly in a browser too.
+const hasNativeTTS=typeof AndroidTTS!=="undefined";
+function speak(t){if(!t.trim())return;
+ if(hasNativeTTS){AndroidTTS.speak(t,rate);return}
+ const u=new SpeechSynthesisUtterance(t);u.rate=rate;
  u.lang=/[\u0900-\u097F]/.test(t)?"hi-IN":"en-IN";speechSynthesis.speak(u)}
-function hush(){speechSynthesis.cancel()}
+function hush(){if(hasNativeTTS){AndroidTTS.stop();return}speechSynthesis.cancel()}
 function say(t){$("out").textContent=t;hush();speak(t)}
 function feed(t){buf+=t;full+=t;$("out").textContent=full;let m;
  while((m=buf.match(/^[\s\S]*?[.!?\u0964\n]/))){speak(m[0]);buf=buf.slice(m[0].length)}}

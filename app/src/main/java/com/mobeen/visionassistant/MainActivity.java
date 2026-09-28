@@ -6,6 +6,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -13,21 +16,31 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Loads the Vision Assistant page (assets/index.html) in a WebView, grants it camera and
  * microphone access, and starts a foreground service so it keeps working with the screen locked.
+ *
+ * <p>Android's WebView does not implement the Web Speech Synthesis API (window.speechSynthesis is
+ * undefined / does nothing there, unlike in Chrome) — that is why speech announcements failed
+ * ("Unable to play media"). This class exposes Android's own TextToSpeech engine to the page as
+ * window.AndroidTTS, and the page calls that instead when running inside this app.
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements TextToSpeech.OnInitListener {
 
   private static final int REQ = 100;
   private WebView webView;
   private boolean serviceStarted = false;
+  private TextToSpeech tts;
+  private boolean ttsReady = false;
 
   @Override
   protected void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
     if (Build.VERSION.SDK_INT >= 27) setShowWhenLocked(true);
+
+    tts = new TextToSpeech(this, this);
 
     webView = new WebView(this);
     WebSettings s = webView.getSettings();
@@ -35,6 +48,7 @@ public class MainActivity extends Activity {
     s.setDomStorageEnabled(true); // keeps the saved API key
     s.setAllowFileAccess(true);
     s.setMediaPlaybackRequiresUserGesture(false);
+    webView.addJavascriptInterface(new TtsBridge(), "AndroidTTS");
     webView.setWebViewClient(new WebViewClient());
     webView.setWebChromeClient(
         new WebChromeClient() {
@@ -47,6 +61,38 @@ public class MainActivity extends Activity {
     webView.loadUrl("file:///android_asset/index.html");
 
     askPermissions();
+  }
+
+  @Override
+  public void onInit(int status) {
+    if (status == TextToSpeech.SUCCESS) {
+      ttsReady = true;
+      tts.setLanguage(new Locale("hi", "IN")); // Devanagari text below auto-falls back if needed
+    }
+  }
+
+  /** Called from the page's JavaScript (window.AndroidTTS.*) to speak using Android's own TTS. */
+  private class TtsBridge {
+    @JavascriptInterface
+    public void speak(String text, float rate) {
+      if (!ttsReady || text == null || text.trim().isEmpty()) return;
+      runOnUiThread(
+          () -> {
+            // Devanagari text needs the Hindi voice; plain Latin text reads better in English.
+            boolean hasDevanagari = text.chars().anyMatch(c -> c >= 0x0900 && c <= 0x097F);
+            tts.setLanguage(hasDevanagari ? new Locale("hi", "IN") : new Locale("en", "IN"));
+            tts.setSpeechRate(rate > 0 ? rate : 1f);
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "va");
+          });
+    }
+
+    @JavascriptInterface
+    public void stop() {
+      runOnUiThread(
+          () -> {
+            if (ttsReady) tts.stop();
+          });
+    }
   }
 
   private void askPermissions() {
@@ -90,6 +136,10 @@ public class MainActivity extends Activity {
 
   @Override
   protected void onDestroy() {
+    if (tts != null) {
+      tts.stop();
+      tts.shutdown();
+    }
     if (isFinishing()) stopService(new Intent(this, KeepAliveService.class));
     super.onDestroy();
   }
