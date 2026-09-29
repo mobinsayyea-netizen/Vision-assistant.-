@@ -67,7 +67,7 @@ function frame(){const w=512,h=Math.round(w*(vid.videoHeight||3)/(vid.videoWidth
 function gem(mi){
  const mode=["TEXT","AUDIO"][mi];ready=false;
  ws=new WebSocket("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+encodeURIComponent(key));
- ws.onopen=()=>{const s={model:"models/"+GEMINI_MODEL,responseModalities:[mode],systemInstruction:{parts:[{text:SYS}]}};
+ ws.onopen=()=>{const s={model:"models/"+GEMINI_MODEL,generationConfig:{responseModalities:[mode]},systemInstruction:{parts:[{text:SYS}]}};
   if(mode=="AUDIO")s.outputAudioTranscription={};ws.send(JSON.stringify({setup:s}))};
  ws.onmessage=async e=>{let d=e.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
   if(m.setupComplete){ready=true;tries=0;gemOut();
