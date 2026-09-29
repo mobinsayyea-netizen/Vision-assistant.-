@@ -82,7 +82,7 @@ public class MainActivity extends Activity implements TextToSpeech.OnInitListene
             boolean hasDevanagari = text.chars().anyMatch(c -> c >= 0x0900 && c <= 0x097F);
             tts.setLanguage(hasDevanagari ? new Locale("hi", "IN") : new Locale("en", "IN"));
             tts.setSpeechRate(rate > 0 ? rate : 1f);
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "va");
+            tts.speak(text, TextToSpeech.QUEUE_ADD, null, "va");
           });
     }
 
