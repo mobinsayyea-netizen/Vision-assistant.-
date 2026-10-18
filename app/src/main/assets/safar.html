@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="hi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>सफ़र मोड</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font:20px system-ui,sans-serif;display:flex;flex-direction:column;min-height:100vh;padding:12px;gap:12px}
+h1{margin:0;font-size:28px}
+button{font:bold 24px system-ui;padding:20px;border:0;border-radius:16px;background:#ffd400;color:#000;width:100%}
+#new{background:#2ecc71;min-height:110px}
+#stopb{background:#e74c3c;color:#fff}
+#out{flex:1;font-size:28px;line-height:1.4;padding:8px;border:2px solid #444;border-radius:12px;min-height:120px;overflow:auto}
+[hidden]{display:none!important}
+</style></head><body>
+<h1>सफ़र मोड</h1>
+<div id="out">सफ़र मोड तैयार। नया सफ़र दबाइए।</div>
+<button id="new">नया सफ़र</button>
+<button id="resume" hidden>पिछला सफ़र जारी रखें</button>
+<button id="where">अभी कहाँ हैं?</button>
+<button id="mine">मेरी सूची पढ़ो</button>
+<button id="stopb">सफ़र रोको</button>
+<button id="back">वापस</button>
+<script src="common.js"></script>
+<script>
+"use strict";
+// ---------------------------------------------------------------- settings and state
+const ANN_R=2.5;      // km: announce "next place" this far away (bus stops: 1 km)
+const ARR_R=0.35;     // km: "arrived" at a place
+const STOP_MS=20000;  // bus standing this long = ask the place name
+let trip=null, mine=store.get("safar_mine",[]);
+let busy=false, dlg=false, lastIdx=0, lastAnnT=0;
+let visited=new Set(), announced=new Set(), destSteps=new Set();
+let offCount=0, stopT0=0, askedStop=false, asked=[], speeds=[], backArmed=false, endTimer=null;
+const cur={km:0,rem:99,off:false};
+
+function pickName(t){return t["name:hi"]||t["name:mr"]||(dev(t.name)?t.name:null)||t.name||t["name:en"]||null}
+function nameFor(s){
+ const m=mine.find(p=>hav(p.lat,p.lon,s.lat,s.lon)<0.4);
+ return m?m.name:s.name}
+function kmh(){
+ if(!speeds.length)return 40;
+ const a=speeds.reduce((x,y)=>x+y,0)/speeds.length*3.6;
+ return Math.min(70,Math.max(20,a))}
+
+// ---------------------------------------------------------------- route data
+function buildRoute(coords){
+ const out=[];let km=0,kept=null;
+ for(let i=0;i<coords.length;i++){
+  const lo=coords[i][0],la=coords[i][1];
+  if(i>0)km+=hav(coords[i-1][1],coords[i-1][0],la,lo);
+  if(kept===null||km-kept>=0.15||i===coords.length-1){out.push([+la.toFixed(5),+lo.toFixed(5),+km.toFixed(3)]);kept=km}}
+ return out}
+function samplePts(route,step){
+ const pts=[];let next=0;
+ for(const p of route){if(p[2]>=next){pts.push(p);next=p[2]+step}}
+ const l=route[route.length-1];if(pts[pts.length-1]!==l)pts.push(l);
+ return pts}
+function nearestOnRoute(route,lat,lon){
+ let bi=0,bd=1e9;
+ for(let i=0;i<route.length;i++){const d=hav(lat,lon,route[i][0],route[i][1]);if(d<bd){bd=d;bi=i}}
+ return{i:bi,d:bd}}
+async function fetchStops(route){
+ const pts=samplePts(route,2.5).map(p=>p[0].toFixed(4)+","+p[1].toFixed(4)).join(",");
+ const q='[out:json][timeout:80];('+
+  'node["place"~"^(city|town|village)$"](around:3000,'+pts+');'+
+  'node["amenity"="bus_station"](around:3000,'+pts+');'+
+  'node["highway"="bus_stop"]["name"](around:1500,'+pts+');'+
+  ');out body qt;';
+ const eps=["https://overpass-api.de/api/interpreter","https://overpass.kumi.systems/api/interpreter"];
+ for(const ep of eps){
+  try{const j=JSON.parse(await http("POST",ep,"data="+encodeURIComponent(q)));return j.elements||[]}catch(e){}}
+ return null}
+function makeStops(els,route){
+ const pri={city:0,town:0,bus_station:0,village:1,bus_stop:2};
+ const list=[];
+ for(const e of els){
+  if(e.type!=="node"||!e.tags)continue;
+  const t=e.tags,name=pickName(t);if(!name)continue;
+  const kind=t.place||(t.amenity==="bus_station"?"bus_station":"bus_stop");
+  const n=nearestOnRoute(route,e.lat,e.lon);if(n.d>3.2)continue;
+  list.push({id:"n"+e.id,name,lat:e.lat,lon:e.lon,km:route[n.i][2],type:kind,p:pri[kind]===undefined?1:pri[kind]})}
+ list.sort((a,b)=>a.p-b.p);
+ const out=[];
+ for(const s of list){if(out.some(o=>o.name===s.name&&hav(o.lat,o.lon,s.lat,s.lon)<1.5))continue;out.push(s)}
+ return out}
+
+// ---------------------------------------------------------------- new trip
+async function newTrip(){
+ if(busy||dlg)return;
+ busy=true;endTrip(true);
+ try{
+  if(!A.startLocation()){await say("पहले लोकेशन की अनुमति दीजिए, फिर नया सफ़र दबाइए।",true);return}
+  fix=null;
+  const r=await ask("कहाँ जाना है? जगह का नाम बोलिए।",3);
+  if(!r){if(lastErr)await noVoiceMsg();else await say("सुनाई नहीं दिया। फिर से नया सफ़र दबाइए।",true);return}
+  await say("आपकी जगह खोज रहा हूँ।",true);
+  const f=await waitFix(40000);
+  if(!f){await say("जीपीएस नहीं मिला। खुली जगह में आकर फिर कोशिश कीजिए।",true);return}
+  const dest=await pickDestination(f,r);
+  if(!dest)return;
+  await say("रास्ता उतार रहा हूँ। कृपया इंतज़ार कीजिए।",true);
+  let rt;
+  try{rt=JSON.parse(await http("GET","https://router.project-osrm.org/route/v1/driving/"+f.lon+","+f.lat+";"+dest.lon+","+dest.lat+"?overview=full&geometries=geojson"))}catch(e){rt=null}
+  if(!rt||!rt.routes||!rt.routes.length){await say("रास्ता नहीं मिल सका। नेट देखकर फिर कोशिश कीजिए।",true);return}
+  const route=buildRoute(rt.routes[0].geometry.coordinates);
+  const total=route[route.length-1][2];
+  const els=await fetchStops(route);
+  let stops=els?makeStops(els,route):[];
+  for(const m of mine){
+   const n=nearestOnRoute(route,m.lat,m.lon);if(n.d>3.2)continue;
+   if(stops.some(s=>hav(s.lat,s.lon,m.lat,m.lon)<0.4))continue;
+   stops.push({id:"m"+Math.round(m.lat*1e5)+"_"+Math.round(m.lon*1e5),name:m.name,lat:m.lat,lon:m.lon,km:route[n.i][2],type:"mine"})}
+  stops=stops.filter(s=>s.km>0.3&&s.km<total-0.3).sort((a,b)=>a.km-b.km);
+  const count=stops.length;
+  stops.push({id:"dest",name:dest.name,lat:dest.lat,lon:dest.lon,km:total,type:"dest"});
+  const t0=Date.now();
+  trip={dest,route,stops,total,t0};
+  store.set("safar_trip",trip);store.set("safar_active",true);
+  visited=new Set();announced=new Set();destSteps=new Set();
+  lastIdx=0;offCount=0;speeds=[];stopT0=0;askedStop=false;asked=[];lastAnnT=0;
+  A.beginService();refreshUI();
+  const eta=new Date(t0+total/40*3600000);
+  await say("तैयार। "+dest.name+" तक "+fmt(total)+"। "+
+   (els?"रास्ते में "+count+" जगहें सहेजी गईं। ":"रास्ते की जगहों की सूची नहीं मिल सकी, सिर्फ़ मंज़िल बताऊँगा। ")+
+   "आप "+clockAt(new Date(t0))+" निकले। अंदाज़न "+clock(eta)+" तक पहुँचेंगे। "+
+   "आप कॉल पर बात कर सकते हैं या ऐप को पीछे रख सकते हैं, मैं बताता रहूँगा। सफ़र शुरू।",true,"chime");
+ }catch(e){
+  show("त्रुटि: "+e.message);
+ }finally{busy=false}}
+
+// ---------------------------------------------------------------- resume
+async function resume(auto){
+ if(busy||dlg)return;
+ const t=store.get("safar_trip",null);
+ if(!t){await say("कोई पिछला सफ़र नहीं है।",true);return}
+ busy=true;
+ try{
+  if(!A.startLocation()){await say("पहले लोकेशन की अनुमति दीजिए।",true);return}
+  A.beginService();
+  const f=await waitFix(40000);
+  if(!f){await say("जीपीएस नहीं मिला।",true);return}
+  lastIdx=0;
+  trip=t;
+  const pr=locate(f);
+  if(pr.d>5){trip=null;await say("आप इस रास्ते पर नहीं हैं। नया सफ़र शुरू कीजिए।",true);return}
+  visited=new Set();announced=new Set();destSteps=new Set();
+  trip.stops.forEach(s=>{if(s.id!=="dest"&&s.km<pr.km-0.5)visited.add(s.id)});
+  offCount=0;stopT0=0;askedStop=false;asked=[];lastAnnT=0;
+  store.set("safar_active",true);
+  await say((auto?"सफ़र जारी है। ":"सफ़र जारी। ")+trip.dest.name+" तक "+fmt(Math.max(0,trip.total-pr.km))+"।",true,"chime");
+ }catch(e){show("त्रुटि: "+e.message)}finally{busy=false}}
+
+// ---------------------------------------------------------------- tracking
+function locate(f){
+ const R=trip.route;let best=0,bd=1e9;
+ const lo=Math.max(0,lastIdx-150),hi=Math.min(R.length-1,lastIdx+600);
+ for(let i=lo;i<=hi;i++){const d=hav(f.lat,f.lon,R[i][0],R[i][1]);if(d<bd){bd=d;best=i}}
+ if(bd>1.5){for(let i=0;i<R.length;i++){const d=hav(f.lat,f.lon,R[i][0],R[i][1]);if(d<bd){bd=d;best=i}}}
+ if(bd<=1.5)lastIdx=best;
+ return{idx:best,km:R[best][2],d:bd,off:bd>1.5}}
+
+function onFix(f){
+ if(!trip||busy)return;
+ const v=f.v;
+ if(v>2){speeds.push(v);if(speeds.length>60)speeds.shift()}
+ const pr=locate(f);
+ cur.km=pr.km;cur.off=pr.off;
+ cur.rem=pr.off?hav(f.lat,f.lon,trip.dest.lat,trip.dest.lon):Math.max(0,trip.total-pr.km);
+ if(dlg)return;
+ if(v<1){
+  if(!stopT0)stopT0=f.t;
+  if(!askedStop&&f.t-stopT0>=STOP_MS&&cur.rem>1.5&&!destSteps.has(0)){askedStop=true;stopDialog(f);return}
+ }else if(v>3){stopT0=0;askedStop=false}
+ announce(f,pr,v<1&&stopT0>0&&f.t-stopT0>=30000)}
+
+function announce(f,pr,stoppedLong){
+ const off=pr.off,rem=cur.rem;
+ if(off){offCount++;if(offCount===5||offCount%120===0)say("आप तय रास्ते से हटे लगते हैं।",false,"chime")}else offCount=0;
+ // destination
+ for(const t of[1,3,10]){
+  if(rem<=t&&!destSteps.has(t)&&!destSteps.has(0)){
+   [1,3,10].filter(x=>x>=t).forEach(x=>destSteps.add(x));
+   if(t<=3)A.vibrate("0,600,200,600,200,600");
+   say("मंज़िल "+trip.dest.name+" "+fmt(rem)+" दूर है। उतरने की तैयारी करें।",true,"chime");return}}
+ // arrived: close enough, or the bus has stopped within 1.5 km (the bus stand can be away from the place's centre)
+ if((rem<=0.4||(stoppedLong&&rem<=1.5))&&!destSteps.has(0)){
+  destSteps.add(0);
+  A.vibrate("0,1200,300,1200,300,1200");
+  say("आपकी मंज़िल "+trip.dest.name+" आ गई। उतरने की तैयारी करें।",true,"arrive");
+  store.set("safar_trip",null);store.set("safar_active",false);refreshUI();
+  endTimer=setTimeout(()=>endTrip(true),300000);return}
+ // places on the way
+ const now=Date.now();
+ let next=null;
+ for(const s of trip.stops){
+  if(s.id==="dest"||visited.has(s.id))continue;
+  const d=hav(f.lat,f.lon,s.lat,s.lon);
+  if(!off&&pr.km>s.km+1&&d>0.6){visited.add(s.id);continue}
+  if(d<=ARR_R){
+   visited.add(s.id);
+   if(s.type==="bus_stop")continue;
+   if(now-lastAnnT<15000)continue;
+   lastAnnT=now;A.vibrate("0,150");say(nameFor(s)+" आ गया।",false,"chime");return}
+  const R=s.type==="bus_stop"?1.0:ANN_R;
+  if(d<=R&&!announced.has(s.id)){
+   if(s.type==="bus_stop"&&now-lastAnnT<60000)continue;
+   if(!next||s.km<next.km)next=s}}
+ if(next&&now-lastAnnT>=20000){
+  announced.add(next.id);lastAnnT=now;
+  say("अगला "+nameFor(next)+", "+fmt(hav(f.lat,f.lon,next.lat,next.lon))+"।",false,"chime")}}
+
+// ---------------------------------------------------------------- bus standing: ask the place name
+function nearestKnown(f,r){
+ const c=(trip?trip.stops.filter(s=>s.id!=="dest"):[]).concat(mine.map((m,i)=>({id:"mine:"+i,name:m.name,lat:m.lat,lon:m.lon,type:"mine"})));
+ let best=null,bd=r;
+ for(const s of c){const d=hav(f.lat,f.lon,s.lat,s.lon);if(d<bd){bd=d;best=s}}
+ return best?{s:best,d:bd}:null}
+async function stopDialog(f){
+ if(dlg)return;
+ dlg=true;
+ try{
+  const now=Date.now();
+  if(asked.some(a=>now-a.t<600000&&hav(a.lat,a.lon,f.lat,f.lon)<0.4))return;
+  asked.push({lat:f.lat,lon:f.lon,t:now});
+  const known=nearestKnown(f,0.6);
+  if(known&&known.s.type==="mine"&&known.d<0.15){visited.add(known.s.id);return}
+  let r=await ask(known?"यह शायद "+nameFor(known.s)+" है। सही है? या सही नाम बोलिए।":"बस रुकी है। यह कौन सी जगह है? नाम बोलिए।",2);
+  if(!r)return;
+  const k=yn(r);
+  if(k==="y"&&known){visited.add(known.s.id);await say("ठीक है।",true);return}
+  if(k==="y"){r=await ask("नाम बोलिए।",2);if(!r)return}
+  else if(k==="n"){r=await ask("सही नाम बोलिए।",2);if(!r||yn(r)==="n")return}
+  const name=clean(r[0]);
+  if(!name)return;
+  const c=await ask(name+"। सेव करूँ?",2);
+  if(!c||yn(c)!=="y"){await say("ठीक है, सेव नहीं किया।",true);return}
+  savePlace(name,f);
+  await say("सेव हो गया।",true);
+ }catch(e){show("त्रुटि: "+e.message)}finally{dlg=false}}
+function savePlace(name,f){
+ const p={name,lat:+f.lat.toFixed(5),lon:+f.lon.toFixed(5)};
+ mine=mine.filter(m=>hav(m.lat,m.lon,p.lat,p.lon)>0.15);
+ mine.push(p);store.set("safar_mine",mine);
+ if(trip){
+  const id="m"+Math.round(p.lat*1e5)+"_"+Math.round(p.lon*1e5);
+  const n=nearestOnRoute(trip.route,p.lat,p.lon);
+  trip.stops.push({id,name,lat:p.lat,lon:p.lon,km:trip.route[n.i][2],type:"mine"});
+  trip.stops.sort((a,b)=>a.km-b.km);
+  visited.add(id);announced.add(id);
+  store.set("safar_trip",trip)}}
+
+// ---------------------------------------------------------------- buttons
+function where(){
+ if(!trip||!fix){say("अभी कोई सफ़र चालू नहीं है।",true);return}
+ const pr=locate(fix);
+ const rem=pr.off?hav(fix.lat,fix.lon,trip.dest.lat,trip.dest.lon):Math.max(0,trip.total-pr.km);
+ let prev=null,next=null;
+ for(const s of trip.stops){
+  if(s.id==="dest")continue;
+  if(s.km<=pr.km+0.1){if(s.type!=="bus_stop"||!prev||prev.type==="bus_stop")prev=s}
+  else if(!visited.has(s.id)&&(!next||(next.type==="bus_stop"&&s.type!=="bus_stop")))next=s}
+ const mins=rem/kmh()*60;
+ let t="आप "+(prev?nameFor(prev)+" के पास से निकल चुके हैं":"रास्ते पर हैं")+"। ";
+ if(next)t+="अगला "+nameFor(next)+", "+fmt(Math.max(0.1,next.km-pr.km))+"। ";
+ t+=trip.dest.name+" तक "+fmt(rem)+", लगभग "+timeStr(mins)+"। ";
+ if(trip.t0)t+="आप "+clockAt(new Date(trip.t0))+" निकले थे। ";
+ t+="अंदाज़न "+clock(new Date(Date.now()+mins*60000))+" तक पहुँचेंगे।";
+ say(t,true)}
+async function readMine(){
+ if(!mine.length){await say("आपकी सूची खाली है।",true);return}
+ await say("आपकी सूची में "+mine.length+" जगहें हैं: "+mine.map(m=>m.name).join(", ")+"।",true);
+ const r=await ask("कुछ हटाना हो तो उसका नाम बोलिए, नहीं तो चुप रहिए।",1);
+ if(!r)return;
+ const q=clean(r[0]);
+ const m=mine.find(x=>x.name.includes(q)||q.includes(x.name));
+ if(!m){await say("वह नाम सूची में नहीं मिला।",true);return}
+ const c=await ask(m.name+" हटाऊँ?",2);
+ if(c&&yn(c)==="y"){mine=mine.filter(x=>x!==m);store.set("safar_mine",mine);await say("हटा दिया।",true)}}
+function endTrip(quiet){
+ if(endTimer){clearTimeout(endTimer);endTimer=null}
+ trip=null;
+ store.set("safar_active",false);
+ try{A.stopLocation();A.endService()}catch(e){}
+ if(!quiet)say("सफ़र रोक दिया।",true)}
+function backAttempt(){
+ if(trip&&!backArmed){
+  backArmed=true;setTimeout(()=>{backArmed=false},4000);
+  say("सफ़र चालू है। बाहर जाने के लिए फिर से वापस दबाइए।",true);return""}
+ endTrip(true);return"exit"}
+window.onBackKey=backAttempt;
+function refreshUI(){
+ const t=store.get("safar_trip",null);
+ $("resume").hidden=!t;
+ if(t)$("resume").textContent="पिछला सफ़र जारी रखें: "+t.dest.name}
+
+$("new").onclick=newTrip;
+$("resume").onclick=()=>resume(false);
+$("where").onclick=where;
+$("mine").onclick=()=>{if(dlg||busy)return;dlg=true;readMine().catch(()=>{}).finally(()=>{dlg=false})};
+$("stopb").onclick=()=>endTrip(false);
+$("back").onclick=()=>{if(backAttempt()==="exit")location.href="index.html"};
+refreshUI();
+if(store.get("safar_active",false)&&store.get("safar_trip",null))resume(true);
+</script></body></html>

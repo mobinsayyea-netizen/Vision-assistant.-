@@ -18,6 +18,10 @@ input,select{width:100%;font-size:20px;padding:12px;margin:6px 0 14px}
 <button id="go">Start</button>
 <div class="row"><button id="stopspeak">Stop Speaking</button><button id="rep">Repeat</button></div>
 <button id="set">Settings</button>
+<button id="safar" style="background:#2ecc71;color:#000">सफ़र मोड</button>
+<button id="walk" style="background:#3498db;color:#fff">पैदल मोड</button>
+<button id="voice" style="background:#ffd400;color:#000">आवाज़ चुनो</button>
+<div class="row"><button id="notesb" style="background:#9b59b6;color:#fff">याद की सूची पढ़ो</button><button id="clrb" style="background:#7f8c8d;color:#fff">याद मिटाओ</button></div>
 <video id="cam" playsinline muted></video>
 <dialog id="dlg"><h2>Settings</h2>
 <label>API key<input id="k" type="password" autocomplete="off"></label>
@@ -68,13 +72,14 @@ let fullCfg=true,lastGood=0;
 function gem(mi){
  const mode=["TEXT","AUDIO"][mi];ready=false;
  ws=new WebSocket("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+encodeURIComponent(key));
- ws.onopen=()=>{const s={model:"models/"+GEMINI_MODEL,generationConfig:{responseModalities:[mode]},systemInstruction:{parts:[{text:SYS}]}};
-  if(fullCfg){s.contextWindowCompression={slidingWindow:{}};s.realtimeInputConfig={activityHandling:"NO_INTERRUPTION"}}
+ ws.onopen=()=>{const s={model:"models/"+GEMINI_MODEL,generationConfig:{responseModalities:[mode]},systemInstruction:{parts:[{text:SYS+MEM_RULES+memText()}]}};
+  if(fullCfg){s.contextWindowCompression={slidingWindow:{}};s.realtimeInputConfig={activityHandling:"NO_INTERRUPTION"};s.tools=TOOLS}
   if(mode=="AUDIO")s.outputAudioTranscription={};ws.send(JSON.stringify({setup:s}))};
  ws.onmessage=async e=>{let d=e.data;if(d instanceof Blob)d=await d.text();const m=JSON.parse(d);
   if(m.setupComplete){ready=true;tries=0;lastGood=Date.now();gemOut();
    ws.send(JSON.stringify({realtimeInput:{text:"Describe completely and in detail what the camera sees right now, following your instructions."}}));return}
   if(m.goAway){try{ws.close()}catch{}return}
+  if(m.toolCall&&m.toolCall.functionCalls){handleTool(m.toolCall.functionCalls);return}
   const c=m.serverContent;if(!c)return;
   if(c.interrupted)reset();
   if(mode=="TEXT"&&c.modelTurn)c.modelTurn.parts.forEach(p=>p.text&&feed(p.text));
@@ -108,7 +113,7 @@ function oai(){
  rec.start()}
 async function ask(t,P){
  ctl=new AbortController();
- const msgs=[{role:"system",content:SYS},...hist.slice(-6),
+ const msgs=[{role:"system",content:SYS+memText()},...hist.slice(-6),
   {role:"user",content:[{type:"text",text:t},{type:"image_url",image_url:{url:frame()}}]}];
  try{
   const r=await fetch(P.url,{method:"POST",signal:ctl.signal,headers:{"Content-Type":"application/json",Authorization:"Bearer "+key},
@@ -144,4 +149,33 @@ $("sv").onclick=()=>{key=$("k").value.trim();rate=parseFloat($("r").value)||1;fa
  ls("k",key);ls("r",rate);ls("f",facing);$("dlg").close();
  const p=detect(key);
  say(p?({gemini:"Gemini",deepseek:"DeepSeek",openai:"OpenAI"})[p]+" key saved":"Key not recognised")};
+// ---- Home memory: things the person teaches, indoors or outdoors ("यह दरवाज़ा है", "यहाँ वॉशरूम है") ----
+// Gemini hears the person and calls remember(note) by itself, so it is saved at once, also when the
+// person says "सेव कर दो" about something the assistant just described. Notes go into every new session.
+let notes=[];try{notes=JSON.parse(ls("home_notes")||"[]")}catch{}
+function saveNotes(){ls("home_notes",JSON.stringify(notes))}
+const MEM_RULES="\n\nMEMORY: The person teaches you about their surroundings, indoors and outdoors. When they say what something is or where it is (for example 'यह दरवाज़ा है', 'यहाँ वॉशरूम है', 'यह कबाड़ है', 'यह टीवी है') or say 'सेव कर दो', 'याद रखो', 'यह सेव करो', call the remember function immediately with one short factual note in Hindi: what it is and where it is, relative to what the camera shows now (left, right, ahead, next to what). If they say a note is wrong, call forget. Then confirm in a few words. Use the remembered notes whenever they apply to what you see and when asked where something is.";
+function memText(){return notes.length?"\n\nThings the person has taught you:\n"+notes.map(n=>"- "+n.text).join("\n"):""}
+const TOOLS=[{functionDeclarations:[
+ {name:"remember",description:"Save a short note about the person's surroundings that they want remembered.",parameters:{type:"OBJECT",properties:{note:{type:"STRING",description:"Short fact in Hindi, for example: दरवाज़ा सामने बाईं तरफ़ है"}},required:["note"]}},
+ {name:"forget",description:"Delete a remembered note that the person says is wrong or no longer true.",parameters:{type:"OBJECT",properties:{note:{type:"STRING",description:"Words from the note to delete"}},required:["note"]}}]}];
+function handleTool(calls){
+ const res=calls.map(c=>{
+  let r="ok";const t=((c.args&&c.args.note)||"").trim();
+  if(c.name==="remember"&&t){
+   notes.push({t:Date.now(),text:t});if(notes.length>150)notes.shift();saveNotes();
+   try{AndroidSafar.vibrate("0,80,60,80")}catch{}
+  }else if(c.name==="forget"&&t){
+   const n=notes.length;notes=notes.filter(x=>!(x.text.includes(t)||t.includes(x.text)));saveNotes();r=(n-notes.length)+" deleted"}
+  return{id:c.id,name:c.name,response:{result:r}}});
+ try{ws.send(JSON.stringify({toolResponse:{functionResponses:res}}))}catch{}}
+$("notesb").onclick=()=>{say(notes.length?"याद की सूची। "+notes.map((n,i)=>(i+1)+". "+n.text).join("। "):"याद की सूची खाली है।")};
+let clrT=0;
+$("clrb").onclick=()=>{
+ if(Date.now()-clrT<6000){notes=[];saveNotes();clrT=0;say("सब मिटा दिया।")}
+ else{clrT=Date.now();say("सब मिटाने के लिए छह सेकंड में फिर दबाइए।")}};
+
+$("safar").onclick=()=>{location.href="safar.html"};
+$("walk").onclick=()=>{location.href="walk.html"};
+$("voice").onclick=()=>{location.href="voice.html"};
 </script></body></html>

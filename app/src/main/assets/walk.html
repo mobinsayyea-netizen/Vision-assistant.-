@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="hi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>पैदल मोड</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font:20px system-ui,sans-serif;display:flex;flex-direction:column;min-height:100vh;padding:12px;gap:12px}
+h1{margin:0;font-size:28px}
+button{font:bold 24px system-ui;padding:20px;border:0;border-radius:16px;background:#ffd400;color:#000;width:100%}
+#follow{background:#2ecc71;min-height:100px}
+#here{background:#3498db;color:#fff;min-height:100px}
+#stopb{background:#e74c3c;color:#fff}
+#out{flex:1;font-size:28px;line-height:1.4;padding:8px;border:2px solid #444;border-radius:12px;min-height:120px;overflow:auto}
+</style></head><body>
+<h1>पैदल मोड</h1>
+<div id="out">पैदल मोड तैयार।</div>
+<button id="follow">सहेजा रास्ता चलो</button>
+<button id="here">यहाँ यह है</button>
+<button id="rec">रास्ता रिकॉर्ड करो</button>
+<button id="save">रास्ता सहेजो</button>
+<button id="go">नई जगह पैदल जाना है</button>
+<button id="free">खुला चलना, सिर्फ़ जगहें बताओ</button>
+<button id="lms">मेरी जगहें पढ़ो</button>
+<button id="stopb">रोको</button>
+<button id="back">वापस</button>
+<script src="common.js"></script>
+<script>
+"use strict";
+// Walk mode.
+//  - Record a walk (any length) and add your own places by voice ("यहाँ मंदिर है").
+//  - Follow a saved or newly made route: a steady beep while you walk straight, a different
+//    sound for left and for right, a different sound when you go the wrong way, a tune on arrival.
+//  - Your saved places are announced whenever you pass near them again.
+let routes=store.get("walk_routes",[]), lms=store.get("walk_lms",[]);
+let mode=null;              // null | "free" | "record" | "follow"
+let busy=false, dlg=false, backArmed=false, endTimer=null;
+let rec=null;
+let path=null, corners=[], pi=0, arrived=false;
+let gState="off", gCand="", gCandN=0, lastSay=0, idleT0=0, noHdSaid=false;
+let cornersDone=new Set(), cornersWarned=new Set();
+const hdHist=[], lmSeen={};
+
+// ---------------------------------------------------------------- path helpers
+function densify(coords){
+ const P=[],C=[];let cum=0;
+ for(let i=0;i<coords.length;i++){
+  if(i===0){P.push(coords[0]);C.push(0);continue}
+  const a=coords[i-1],b=coords[i];
+  const d=hav(a[0],a[1],b[0],b[1])*1000;
+  const n=Math.max(1,Math.ceil(d/5));
+  for(let k=1;k<=n;k++){const t=k/n;P.push([a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]);cum+=d/n;C.push(cum)}}
+ return{P,C}}
+function smooth(pts){
+ if(pts.length<5)return pts;
+ const o=[];
+ for(let i=0;i<pts.length;i++){
+  const a=Math.max(0,i-1),b=Math.min(pts.length-1,i+1);
+  let la=0,lo=0,n=0;
+  for(let k=a;k<=b;k++){la+=pts[k][0];lo+=pts[k][1];n++}
+  o.push([la/n,lo/n])}
+ o[0]=pts[0];o[o.length-1]=pts[pts.length-1];
+ return o}
+function lengthM(pts){let s=0;for(let i=1;i<pts.length;i++)s+=hav(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1])*1000;return s}
+function findCorners(P,C){
+ const W=15,cand=[];let a=0,b=0;
+ for(let k=0;k<P.length;k++){
+  while(a<k&&C[k]-C[a+1]>=W)a++;
+  if(C[k]-C[a]<W)continue;
+  if(b<k)b=k;
+  while(b<P.length-1&&C[b]-C[k]<W)b++;
+  if(C[b]-C[k]<W)continue;
+  const b1=bearing(P[a][0],P[a][1],P[k][0],P[k][1]);
+  const b2=bearing(P[k][0],P[k][1],P[b][0],P[b][1]);
+  const t=angDiff(b2,b1);
+  if(Math.abs(t)>=45)cand.push({k,t})}
+ const best=cl=>{let m=cl[0];for(const c of cl)if(Math.abs(c.t)>Math.abs(m.t))m=c;return{k:m.k,dir:m.t>0?"right":"left",ang:Math.abs(m.t)}};
+ const out=[];let cl=[];
+ for(const c of cand){
+  if(cl.length&&C[c.k]-C[cl[cl.length-1].k]>30){out.push(best(cl));cl=[]}
+  cl.push(c)}
+ if(cl.length)out.push(best(cl));
+ return out}
+function locP(f){
+ const P=path.P;let best=pi,bd=1e9;
+ const run=(l,h)=>{for(let i=l;i<=h;i++){const d=hav(f.lat,f.lon,P[i][0],P[i][1])*1000;if(d<bd){bd=d;best=i}}};
+ run(Math.max(0,pi-40),Math.min(P.length-1,pi+120));
+ if(bd>60)run(0,P.length-1);
+ pi=best;return{i:best,d:bd}}
+function avgHd(){
+ const v=hdHist.slice(-3).filter(x=>x>=0);
+ if(!v.length)return-1;
+ let sx=0,sy=0;for(const h of v){sx+=Math.cos(rad(h));sy+=Math.sin(rad(h))}
+ return(Math.atan2(sy,sx)*180/Math.PI+360)%360}
+
+// ---------------------------------------------------------------- fixes
+function onFix(f){
+ hdHist.push(f.hd);if(hdHist.length>6)hdHist.shift();
+ if(!mode||dlg||busy)return;
+ checkLms(f);
+ if(mode==="record")recStep(f);
+ else if(mode==="follow"&&path&&!arrived)guideStep(f)}
+
+function checkLms(f){
+ const now=Date.now();
+ for(const m of lms){
+  if(now-(lmSeen[m.id]||0)<300000)continue;
+  if(hav(f.lat,f.lon,m.lat,m.lon)*1000<=25){lmSeen[m.id]=now;say("यहाँ "+m.name+" है।",false,"chime");return}}}
+
+function recStep(f){
+ if(f.acc>30)return;
+ const last=rec.pts[rec.pts.length-1];
+ if(!last||hav(last[0],last[1],f.lat,f.lon)*1000>=4){
+  rec.pts.push([+f.lat.toFixed(6),+f.lon.toFixed(6)]);
+  if(rec.pts.length%25===0)store.set("walk_rec",rec)}}
+
+// ---------------------------------------------------------------- guidance while following a path
+function guideStep(f){
+ const P=path.P,C=path.C;
+ const lp=locP(f);
+ const remain=C[C.length-1]-C[lp.i];
+ if(remain<=15){
+  arrived=true;A.guide("off");A.vibrate("0,1200,300,1200,300,1200");
+  say("आपकी मंज़िल आ गई।",true,"arrive");
+  endTimer=setTimeout(()=>endMode(),20000);return}
+ let st;
+ if(f.v<0.4){
+  if(!idleT0)idleT0=f.t;
+  st=(f.t-idleT0>=5000)?"idle":gState;
+ }else{
+  idleT0=0;
+  const hd=avgHd();
+  if(hd<0){
+   st="wait";
+   if(!noHdSaid){noHdSaid=true;say("कुछ कदम सीधा चलिए, दिशा समझ रहा हूँ।",false)}
+  }else{
+   let j=lp.i;while(j<P.length-1&&C[j]-C[lp.i]<12)j++;
+   for(const c of corners){
+    if(cornersDone.has(c.k))continue;
+    if(C[c.k]-C[lp.i]<=3){cornersDone.add(c.k);continue}
+    if(c.k<j)j=c.k;
+    break}
+   const desired=bearing(f.lat,f.lon,P[j][0],P[j][1]);
+   const err=angDiff(desired,hd);
+   if(Math.abs(err)>130)st="back";
+   else if(Math.abs(err)<=22)st="straight";
+   else st=err>0?"right":"left";
+  }
+ }
+ // corner warning
+ for(const c of corners){
+  if(cornersDone.has(c.k))continue;
+  const dd=C[c.k]-C[lp.i];
+  if(dd<=3){cornersDone.add(c.k);continue}
+  if(dd<=15&&!cornersWarned.has(c.k)){
+   cornersWarned.add(c.k);
+   A.vibrate(c.dir==="left"?"0,150,100,150":"0,150,100,150,100,150");
+   A.cue(c.dir);
+   const steps=Math.max(5,Math.round(dd/0.7/5)*5);
+   say("करीब "+steps+" कदम बाद "+(c.dir==="left"?"बाएँ":"दाएँ")+" मुड़ना है।",false);
+   lastSay=Date.now()}
+  break}
+ // debounce (two fixes in a row) before changing the sound
+ if(st===gCand)gCandN++;else{gCand=st;gCandN=1}
+ if(st!==gState&&(gCandN>=2||st==="idle"||st==="wait"))switchState(st);
+ // far from the path
+ if(lp.d>50&&Date.now()-lastSay>20000){lastSay=Date.now();say("आप रास्ते से "+fmt(lp.d/1000)+" दूर हैं।",false)}
+ // repeat the correction now and then while still wrong
+ if((gState==="left"||gState==="right"||gState==="back")&&Date.now()-lastSay>12000){lastSay=Date.now();announceState(gState)}}
+
+function announceState(st){
+ if(st==="left")say("बाएँ मुड़िए।",false);
+ else if(st==="right")say("दाएँ मुड़िए।",false);
+ else if(st==="back")say("आप उल्टी तरफ़ जा रहे हैं। पीछे मुड़िए।",false)}
+function switchState(st){
+ const prev=gState;gState=st;
+ A.guide(st==="straight"||st==="left"||st==="right"||st==="back"?st:"off");
+ if(st==="left"||st==="right"||st==="back"){lastSay=Date.now();announceState(st)}
+ else if(st==="straight"&&(prev==="left"||prev==="right"||prev==="back")){lastSay=Date.now();say("ठीक है, सीधा चलिए।",false)}}
+
+function beginGuide(coords,label,reversed){
+ const sm=smooth(coords);
+ path=densify(sm);corners=findCorners(path.P,path.C);
+ pi=0;arrived=false;gState="off";gCand="";gCandN=0;idleT0=0;noHdSaid=false;
+ cornersDone=new Set();cornersWarned=new Set();lastSay=0;hdHist.length=0;
+ mode="follow";
+ const n=(store.get("walk_intro",0)||0);store.set("walk_intro",n+1);
+ const total=path.C[path.C.length-1];
+ let t=label+" चलना शुरू। "+fmt(total/1000)+(reversed?"। उल्टी दिशा में":"")+"। ";
+ if(n<3)t+="सीधा चलने पर धीमी बीप बजती रहेगी। बाएँ मुड़ना हो तो बाएँ कान में दो नीची बीप, दाएँ मुड़ना हो तो दाएँ कान में दो ऊँची बीप। उल्टी तरफ़ जाने पर लंबी भारी आवाज़। मंज़िल पर धुन। यह सिर्फ़ मदद है, छड़ी साथ रखिए। ";
+ else t+="छड़ी साथ रखिए। ";
+ t+="आप कॉल पर बात कर सकते हैं या ऐप को पीछे रख सकते हैं। चलना शुरू कीजिए।";
+ return say(t,true,"chime")}
+
+// ---------------------------------------------------------------- buttons
+function needGps(){return A.startLocation()}
+async function startRecord(){
+ if(busy||dlg)return;
+ if(mode){await say("पहले 'रोको' दबाइए।",true);return}
+ busy=true;
+ try{
+  if(!needGps()){await say("पहले लोकेशन की अनुमति दीजिए, फिर दबाइए।",true);return}
+  A.beginService();
+  const f=await waitFix(40000);
+  if(!f){await say("जीपीएस नहीं मिला। खुली जगह में आइए।",true);return}
+  rec={pts:[[+f.lat.toFixed(6),+f.lon.toFixed(6)]],t:Date.now()};
+  store.set("walk_rec",rec);mode="record";
+  await say("रिकॉर्ड शुरू। अब चलिए। कोई जगह जोड़नी हो तो 'यहाँ यह है' दबाइए। पहुँचकर 'रास्ता सहेजो' दबाइए।",true,"chime");
+ }catch(e){show("त्रुटि: "+e.message)}finally{busy=false}}
+
+async function saveRoute(){
+ if(dlg||busy)return;
+ const r=(mode==="record"?rec:null)||store.get("walk_rec",null);
+ if(!r||r.pts.length<5){await say("सहेजने लायक रास्ता नहीं है।",true);return}
+ dlg=true;A.guide("off");
+ try{
+  const len=lengthM(r.pts);
+  const a=await ask("रास्ते का नाम बोलिए।",2);
+  let name="रास्ता "+(routes.length+1);
+  if(a){
+   const nm=clean(a[0]);
+   const c=await ask(nm+"। सही है?",2);
+   if(c&&yn(c)!=="n")name=nm}
+  routes.push({id:Date.now(),name,pts:r.pts,len,t:Date.now()});
+  store.set("walk_routes",routes);
+  rec=null;store.set("walk_rec",null);
+  endMode();
+  await say(name+" सेव हो गया। "+fmt(len/1000)+" का रास्ता।",true,"chime");
+ }catch(e){show("त्रुटि: "+e.message)}finally{dlg=false}}
+
+async function startFollow(){
+ if(busy||dlg)return;
+ if(mode){await say("पहले 'रोको' दबाइए।",true);return}
+ if(!routes.length){await say("कोई रास्ता सहेजा नहीं है। पहले 'रास्ता रिकॉर्ड करो' दबाइए।",true);return}
+ busy=true;
+ try{
+  let r=routes[0];
+  if(routes.length>1){
+   await say("सहेजे रास्ते: "+routes.map(x=>x.name).join(", ")+"।",true);
+   const a=await ask("कौन सा रास्ता चलना है? नाम बोलिए।",2);
+   if(!a){await say("सुनाई नहीं दिया।",true);return}
+   const q=clean(a[0]);
+   r=routes.find(x=>x.name.includes(q)||q.includes(x.name));
+   if(!r){await say("वह रास्ता नहीं मिला।",true);return}}
+  if(!needGps()){await say("पहले लोकेशन की अनुमति दीजिए, फिर दबाइए।",true);return}
+  A.beginService();
+  const f=await waitFix(40000);
+  if(!f){await say("जीपीएस नहीं मिला। खुली जगह में आइए।",true);return}
+  const pts=r.pts;
+  const ds=hav(f.lat,f.lon,pts[0][0],pts[0][1])*1000;
+  const de=hav(f.lat,f.lon,pts[pts.length-1][0],pts[pts.length-1][1])*1000;
+  if(Math.min(ds,de)>300){await say("आप इस रास्ते के सिरे से बहुत दूर हैं।",true);return}
+  const rev=de<ds;
+  await beginGuide(rev?pts.slice().reverse():pts,r.name,rev);
+ }catch(e){show("त्रुटि: "+e.message)}finally{busy=false}}
+
+async function goNew(){
+ if(busy||dlg)return;
+ if(mode){await say("पहले 'रोको' दबाइए।",true);return}
+ busy=true;
+ try{
+  if(!needGps()){await say("पहले लोकेशन की अनुमति दीजिए, फिर दबाइए।",true);return}
+  fix=null;
+  const r=await ask("कहाँ पैदल जाना है? जगह का नाम बोलिए।",3);
+  if(!r){if(lastErr)await noVoiceMsg();else await say("सुनाई नहीं दिया।",true);return}
+  await say("आपकी जगह खोज रहा हूँ।",true);
+  A.beginService();
+  const f=await waitFix(40000);
+  if(!f){await say("जीपीएस नहीं मिला। खुली जगह में आइए।",true);return}
+  const dest=await pickDestination(f,r);
+  if(!dest)return;
+  await say("पैदल रास्ता उतार रहा हूँ।",true);
+  let rt;
+  try{rt=JSON.parse(await http("GET","https://routing.openstreetmap.de/routed-foot/route/v1/foot/"+f.lon+","+f.lat+";"+dest.lon+","+dest.lat+"?overview=full&geometries=geojson"))}catch(e){rt=null}
+  if(!rt||!rt.routes||!rt.routes.length){await say("पैदल रास्ता नहीं मिल सका। रिकॉर्ड करके चलना ठीक रहेगा।",true);return}
+  const coords=rt.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);
+  await beginGuide(coords,dest.name+" तक",false);
+ }catch(e){show("त्रुटि: "+e.message)}finally{busy=false}}
+
+async function startFree(){
+ if(busy||dlg)return;
+ if(mode){await say("पहले 'रोको' दबाइए।",true);return}
+ busy=true;
+ try{
+  if(!needGps()){await say("पहले लोकेशन की अनुमति दीजिए, फिर दबाइए।",true);return}
+  A.beginService();
+  mode="free";
+  await say("खुला चलना चालू। आपकी सहेजी जगहें पास आने पर बताऊँगा। नई जगह जोड़नी हो तो 'यहाँ यह है' दबाइए।",true,"chime");
+ }catch(e){show("त्रुटि: "+e.message)}finally{busy=false}}
+
+async function addHere(){
+ if(dlg||busy)return;
+ if(!fix||Date.now()-fix.t>120000){await say("लोकेशन अभी नहीं मिली। पहले कोई मोड चालू कीजिए।",true);return}
+ dlg=true;A.guide("off");gState="off";gCand="";
+ const f=fix;
+ try{
+  const r=await ask("यहाँ क्या है? नाम बोलिए।",2);
+  if(!r)return;
+  const name=clean(r[0]);if(!name)return;
+  const c=await ask(name+"। सेव करूँ?",2);
+  if(!c||yn(c)!=="y"){await say("ठीक है, सेव नहीं किया।",true);return}
+  const m={id:Date.now(),name,lat:+f.lat.toFixed(5),lon:+f.lon.toFixed(5)};
+  lms.push(m);store.set("walk_lms",lms);lmSeen[m.id]=Date.now();
+  await say("सेव हो गया। अगली बार यहाँ आने पर बताऊँगा।",true);
+ }catch(e){show("त्रुटि: "+e.message)}finally{dlg=false}}
+
+async function readLms(){
+ if(dlg||busy)return;
+ dlg=true;
+ try{
+  if(!lms.length){await say("आपकी सूची खाली है।",true);return}
+  await say("आपकी सूची में "+lms.length+" जगहें हैं: "+lms.map(m=>m.name).join(", ")+"।",true);
+  const r=await ask("कुछ हटाना हो तो उसका नाम बोलिए, नहीं तो चुप रहिए।",1);
+  if(!r)return;
+  const q=clean(r[0]);
+  const m=lms.find(x=>x.name.includes(q)||q.includes(x.name));
+  if(!m){await say("वह नाम सूची में नहीं मिला।",true);return}
+  const c=await ask(m.name+" हटाऊँ?",2);
+  if(c&&yn(c)==="y"){lms=lms.filter(x=>x!==m);store.set("walk_lms",lms);await say("हटा दिया।",true)}
+ }catch(e){show("त्रुटि: "+e.message)}finally{dlg=false}}
+
+function endMode(){
+ if(endTimer){clearTimeout(endTimer);endTimer=null}
+ mode=null;path=null;corners=[];gState="off";
+ try{A.guide("off");A.stopLocation();A.endService()}catch(e){}}
+async function stopAll(){
+ if(dlg)return;
+ if(mode==="record"&&rec&&rec.pts.length>=5){
+  dlg=true;A.guide("off");
+  let yes=false;
+  try{const c=await ask("रिकॉर्ड किया रास्ता सहेजूँ?",2);yes=!!(c&&yn(c)==="y")}finally{dlg=false}
+  if(yes){await saveRoute();return}
+  rec=null;store.set("walk_rec",null)}
+ endMode();
+ say("रोक दिया।",true)}
+function backAttempt(){
+ if(mode&&!backArmed){
+  backArmed=true;setTimeout(()=>{backArmed=false},4000);
+  say("पैदल मोड चालू है। बाहर जाने के लिए फिर से वापस दबाइए।",true);return""}
+ endMode();return"exit"}
+window.onBackKey=backAttempt;
+
+$("follow").onclick=startFollow;
+$("here").onclick=addHere;
+$("rec").onclick=startRecord;
+$("save").onclick=saveRoute;
+$("go").onclick=goNew;
+$("free").onclick=startFree;
+$("lms").onclick=readLms;
+$("stopb").onclick=stopAll;
+$("back").onclick=()=>{if(backAttempt()==="exit")location.href="index.html"};
+
+// an unfinished recording survives a restart: carry on recording
+(async()=>{
+ const r=store.get("walk_rec",null);
+ if(r&&r.pts&&r.pts.length>=1){
+  rec=r;
+  if(A.startLocation()){A.beginService();mode="record";
+   await say("अधूरी रिकॉर्डिंग जारी है। पहुँचकर 'रास्ता सहेजो' दबाइए, या 'रोको' दबाकर छोड़ दीजिए।",true,"chime")}}})();
+</script></body></html>
